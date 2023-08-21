@@ -1,0 +1,14 @@
+name: CBITPaymentsAPI
+version: 0.3.3
+authors: [ScotsmanDev, 0xConflict]
+main: com.cubedao.wallet.CubeDAO
+api-version: 1.17
+softdepend:
+  - Geyser-Spigot
+
+commands:
+  wallet:
+    description: Open a GUI with information about your player balance.
+    usage: /wallet
+    permission: cbitpaymentsapi.wallet
+    default: true

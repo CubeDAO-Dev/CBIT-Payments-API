@@ -1,0 +1,206 @@
+package com.cubedao.wallet.contracts.cubedao;
+
+import com.cubedao.wallet.CubeDAO;
+import com.cubedao.wallet.contracts.wrappers.polygon.PolygonPlayers;
+import com.cubedao.wallet.objects.NFTPlayer;
+import com.cubedao.wallet.objects.Wallet;
+import com.cubedao.wallet.rpcs.Polygon;
+import com.cubedao.wallet.util.ColorUtil;
+import org.bukkit.Bukkit;
+import org.bukkit.Sound;
+import org.bukkit.entity.Player;
+import org.json.JSONObject;
+import org.web3j.abi.FunctionReturnDecoder;
+import org.web3j.abi.TypeReference;
+import org.web3j.abi.datatypes.Address;
+import org.web3j.abi.datatypes.Type;
+import org.web3j.crypto.Credentials;
+import org.web3j.crypto.Hash;
+import org.web3j.protocol.core.DefaultBlockParameterName;
+import org.web3j.protocol.core.methods.request.EthFilter;
+import org.web3j.protocol.core.methods.response.Log;
+
+import java.net.URI;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
+import java.text.MessageFormat;
+import java.util.Iterator;
+import java.util.List;
+import java.util.UUID;
+import java.util.concurrent.CompletableFuture;
+import java.util.logging.Level;
+
+public class Players {
+    private PolygonPlayers polygonPlayersContract;
+    private boolean debug;
+
+    public static final String PLAYER_PRIMARY_WALLET_SET = Hash.sha3String("PlayerPrimaryWalletSet(string,string,address)");
+    public static final String PLAYER_SECONDARY_WALLET_SET = Hash.sha3String("PlayerSecondaryWalletSet(string,string,address)");
+    public static final String PLAYER_SECONDARY_WALLET_REMOVED = Hash.sha3String("PlayerSecondaryWalletRemoved(string,string,address)");
+
+    public Players() {
+        CubeDAO cubeDao = CubeDAO.getInstance();
+        Polygon polygonRPC = cubeDao.getPolygonRPC();
+        Credentials credentials = null;
+        debug = cubeDao.getNftConfig().isDebug();
+
+        try {
+            credentials = Credentials.create("0x0000000000000000000000000000000000000000000000000000000000000000"); // We're only reading so this can be anything
+        } catch (Exception ex) {
+            ex.printStackTrace();
+        }
+
+        this.polygonPlayersContract = PolygonPlayers.load(
+                cubeDao.getNftConfig().getPolygonPlayerContract(),
+                polygonRPC.getPolygonWeb3j(),
+                credentials,
+                polygonRPC.getGasProvider()
+        );
+
+        startPlayerWalletUpdateListener();
+    }
+
+    public String getPlayerPrimaryWallet(String playerUUID) throws Exception {
+        return this.polygonPlayersContract.getPlayerPrimaryWallet(playerUUID.replace("-", "")).send();
+    }
+
+    public CompletableFuture<String> getPlayerPrimaryWalletAsync(String playerUUID) throws Exception {
+        return this.polygonPlayersContract.getPlayerPrimaryWallet(playerUUID.replace("-", "")).sendAsync();
+    }
+
+    public List<String> getPlayerSecondaryWallets(String playerUUID) throws Exception {
+        return this.polygonPlayersContract.getPlayerSecondaryWallets(playerUUID.replace("-", "")).send();
+    }
+
+    public CompletableFuture<List> getPlayerSecondaryWalletsAsync(String playerUUID) throws Exception {
+        return this.polygonPlayersContract.getPlayerSecondaryWallets(playerUUID.replace("-", "")).sendAsync();
+    }
+
+    public JSONObject getPlayerStateData(String playerUUID, String setterWalletAddress) throws Exception {
+        String stateDataUrl = this.polygonPlayersContract.getPlayerStateData(playerUUID.replace("-", ""), setterWalletAddress, true).send();
+
+        if (stateDataUrl.isEmpty()) {
+            return null;
+        }
+
+        return new JSONObject(HttpClient.newHttpClient().send(HttpRequest.newBuilder().uri(URI.create(stateDataUrl)).build(), HttpResponse.BodyHandlers.ofString()).body());
+    }
+
+    public JSONObject getPlayerStateDataAsync(String playerUUID, String setterWalletAddress) throws Exception {
+        CompletableFuture<String> stateDataUrl = this.polygonPlayersContract.getPlayerStateData(playerUUID.replace("-", ""), setterWalletAddress, true).sendAsync();
+
+        if (stateDataUrl.get().isEmpty()) {
+            return null;
+        }
+
+        return new JSONObject(HttpClient.newHttpClient().send(HttpRequest.newBuilder().uri(URI.create(stateDataUrl.get())).build(), HttpResponse.BodyHandlers.ofString()).body());
+    }
+
+    private void startPlayerWalletUpdateListener() {
+        EthFilter transferFilter = new EthFilter(
+                DefaultBlockParameterName.LATEST,
+                DefaultBlockParameterName.LATEST,
+                this.polygonPlayersContract.getContractAddress()
+        ).addOptionalTopics(Players.PLAYER_PRIMARY_WALLET_SET, Players.PLAYER_SECONDARY_WALLET_SET, Players.PLAYER_SECONDARY_WALLET_REMOVED);
+
+        CubeDAO.getInstance().getPolygonRPC().getPolygonWeb3j().ethLogFlowable(transferFilter).subscribe(log -> {
+            String eventHash = log.getTopics().get(0);
+
+            if (eventHash.equals(PLAYER_PRIMARY_WALLET_SET)) {
+                this.paymentListener_handlePrimaryWalletSetEvent(log);
+            } else if (eventHash.equals(PLAYER_SECONDARY_WALLET_SET)) {
+                this.paymentListener_handleSecondaryWalletSetEvent(log);
+            } else if (eventHash.equals(PLAYER_SECONDARY_WALLET_REMOVED)) {
+                this.paymentListener_handleSecondaryWalletRemovedEvent(log);
+            }
+        },
+        error -> {
+            error.printStackTrace();
+        });
+    }
+
+    public void paymentListener_handlePrimaryWalletSetEvent(Log log) {
+        CubeDAO plugin = CubeDAO.getInstance();
+
+        if (debug) plugin.getLogger().log(Level.INFO, "Primary wallet updated");
+
+        List<String> topics = log.getTopics();
+        List<Type> data = FunctionReturnDecoder.decode(log.getData(), PolygonPlayers.PLAYERPRIMARYWALLETSET_EVENT.getNonIndexedParameters());
+
+        String playerUUID = (String) data.get(0).getValue();
+        Address walletAddress = (Address) FunctionReturnDecoder.decodeIndexedValue(topics.get(2), new TypeReference<Address>(false) {});
+
+        if (debug) plugin.getLogger().log(Level.INFO, "Primary wallet of uuid " + playerUUID + " set to " + walletAddress);
+
+        UUID uuid = java.util.UUID.fromString (playerUUID.replaceFirst("(\\p{XDigit}{8})(\\p{XDigit}{4})(\\p{XDigit}{4})(\\p{XDigit}{4})(\\p{XDigit}+)","$1-$2-$3-$4-$5"));
+        NFTPlayer nftPlayer = NFTPlayer.getByUUID(uuid);
+        if (nftPlayer != null) {
+            nftPlayer.setPrimaryWallet(new Wallet(nftPlayer, walletAddress.getValue()));
+
+            Player p = Bukkit.getPlayer(uuid);
+            if (p != null && p.isOnline()) {
+                p.sendMessage(ColorUtil.rgb(MessageFormat.format(CubeDAO.getInstance().getLangConfig().getSetPrimaryWallet(), walletAddress.getValue())));
+                p.playSound(p.getLocation(), Sound.ENTITY_EXPERIENCE_ORB_PICKUP, 1, 1);
+            }
+        }
+    }
+
+    public void paymentListener_handleSecondaryWalletSetEvent(Log log) {
+        if (debug) CubeDAO.getInstance().getLogger().log(Level.INFO, "Secondary wallet updated (addition)");
+
+        List<String> topics = log.getTopics();
+        List<Type> data = FunctionReturnDecoder.decode(log.getData(), PolygonPlayers.PLAYERSECONDARYWALLETSET_EVENT.getNonIndexedParameters());
+
+        String playerUUID = (String) data.get(0).getValue();
+        Address walletAddress = (Address) FunctionReturnDecoder.decodeIndexedValue(topics.get(2), new TypeReference<Address>(false) {});
+
+        if (debug) CubeDAO.getInstance().getLogger().log(Level.INFO, "Added secondary wallet of " +  walletAddress.toString() + " to uuid " + playerUUID);
+
+        UUID uuid = java.util.UUID.fromString (playerUUID.replaceFirst("(\\p{XDigit}{8})(\\p{XDigit}{4})(\\p{XDigit}{4})(\\p{XDigit}{4})(\\p{XDigit}+)","$1-$2-$3-$4-$5"));
+        NFTPlayer nftPlayer = NFTPlayer.getByUUID(uuid);
+        if (nftPlayer != null) {
+            nftPlayer.getWallets().add(new Wallet(nftPlayer, walletAddress.getValue()));
+            Player p = Bukkit.getPlayer(uuid);
+            if (p.isOnline()) {
+                p.sendMessage(ColorUtil.rgb(MessageFormat.format(CubeDAO.getInstance().getLangConfig().getSetSecondaryWallet(), walletAddress.getValue())));
+                p.playSound(p.getLocation(), Sound.ENTITY_EXPERIENCE_ORB_PICKUP, 1, 1);
+            }
+        }
+    }
+
+    public void paymentListener_handleSecondaryWalletRemovedEvent(Log log) {
+        CubeDAO plugin = CubeDAO.getInstance();
+
+        if (debug) plugin.getLogger().log(Level.INFO, "Secondary wallet updated (removal)");
+
+        List<String> topics = log.getTopics();
+        List<Type> data = FunctionReturnDecoder.decode(log.getData(), PolygonPlayers.PLAYERSECONDARYWALLETREMOVED_EVENT.getNonIndexedParameters());
+
+        String playerUUID = (String) data.get(0).getValue();
+        Address walletAddress = (Address) FunctionReturnDecoder.decodeIndexedValue(topics.get(2), new TypeReference<Address>(false) {});
+
+        if (debug) plugin.getLogger().log(Level.INFO, "Removed secondary wallet of " +  walletAddress.toString() + " from uuid " + playerUUID);
+
+        UUID uuid = java.util.UUID.fromString (playerUUID.replaceFirst("(\\p{XDigit}{8})(\\p{XDigit}{4})(\\p{XDigit}{4})(\\p{XDigit}{4})(\\p{XDigit}+)","$1-$2-$3-$4-$5"));
+        NFTPlayer nftPlayer = NFTPlayer.getByUUID(uuid);
+        if (nftPlayer != null) {
+            String address = walletAddress.getValue();
+
+            Iterator<Wallet> iterator = nftPlayer.getWallets().iterator();
+            while (iterator.hasNext()) {
+                Wallet wallet = iterator.next();
+                if (address.equalsIgnoreCase(wallet.getAddress())) {
+                    plugin.removeWallet(wallet);
+                    iterator.remove();
+                }
+            }
+
+            Player p = Bukkit.getPlayer(uuid);
+            if (p != null && p.isOnline()) {
+                p.sendMessage(ColorUtil.rgb(MessageFormat.format(CubeDAO.getInstance().getLangConfig().getRemoveSecondaryWallet(), walletAddress.getValue())));
+                p.playSound(p.getLocation(), Sound.BLOCK_NOTE_BLOCK_BASS, 1, 1);
+            }
+        }
+    }
+}
